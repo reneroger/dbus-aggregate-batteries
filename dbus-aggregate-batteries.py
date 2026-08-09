@@ -613,39 +613,58 @@ class DbusAggBatService(object):
             logging.info("> %d batteries found." % (batteriesCount))
 
         # make sure the correct number of batteries and SmartShunts has been found
-        if (batteriesCount == settings.NR_OF_BATTERIES) and (len(self._smartShunt_list) >= NR_OF_SMARTSHUNTS):
-            if self._ownCharge < 0:
-                self._ownCharge = Soc / 100.0
-                Soc /= InstalledCapacity
-            if settings.CURRENT_FROM_VICTRON:
-                self._searchTrials = 1
-                # if current from Victron stuff search multi/quattro on DBus
-                GLib.timeout_add_seconds(settings.UPDATE_INTERVAL_FIND_DEVICES, self._find_multis)
-            else:
-                self._timeOld = tt.time()
-                # if current from BMS start the _update loop
-                GLib.timeout_add_seconds(settings.UPDATE_INTERVAL_DATA, self._update)
+        found_all = (batteriesCount == settings.NR_OF_BATTERIES) and (len(self._smartShunt_list) >= NR_OF_SMARTSHUNTS)
 
-            # all OK, stop calling this function
-            return False
-        # if the correct number has not been found yet, repeat until SEARCH_TRIALS is reached
-        elif self._searchTrials < settings.SEARCH_TRIALS:
+        # Keep waiting while the expected number has not shown up yet. At boot the
+        # serial drivers need up to a minute per port to enumerate their packs, and
+        # starting on a partially enumerated bus would hand DVCC a bank that is
+        # smaller than the one actually wired to the busbar.
+        if not found_all and self._searchTrials < settings.SEARCH_TRIALS:
             self._searchTrials += 1
             # next trial
             return True
-        # bail out if correct number of batteries and SmartShunts can not be found after SEARCH_TRIALS tries
+
+        # The grace period is over and batteries are still missing. Refusing to run
+        # is the worse failure: a pack that dropped off the bus is still wired to
+        # the busbar and still protected by its own BMS, whereas an aggregator that
+        # never registers leaves the whole system without a BMS, and DVCC then
+        # blocks charge and discharge completely. Serve what is there and say so.
+        if not found_all:
+            if batteriesCount < 2 or len(self._smartShunt_list) < NR_OF_SMARTSHUNTS:
+                if NR_OF_SMARTSHUNTS > 0:
+                    logging.error(
+                        "Required nr of batteries (%d) or SmartShunts (%d) not found. Exiting...",
+                        settings.NR_OF_BATTERIES,
+                        NR_OF_SMARTSHUNTS,
+                    )
+                else:
+                    logging.info(self._batteries_dict)
+                    logging.error("Required number of batteries not found. Exiting...")
+                tt.sleep(settings.TIME_BEFORE_RESTART)
+                sys.exit(1)
+
+            logging.warning(
+                "Only %d of %d batteries found. Aggregating the ones that answer. "
+                "Capacity and current limits refer to these %d batteries, not to the whole bank.",
+                batteriesCount,
+                settings.NR_OF_BATTERIES,
+                batteriesCount,
+            )
+
+        if self._ownCharge < 0:
+            self._ownCharge = Soc / 100.0
+            Soc /= InstalledCapacity
+        if settings.CURRENT_FROM_VICTRON:
+            self._searchTrials = 1
+            # if current from Victron stuff search multi/quattro on DBus
+            GLib.timeout_add_seconds(settings.UPDATE_INTERVAL_FIND_DEVICES, self._find_multis)
         else:
-            if NR_OF_SMARTSHUNTS > 0:
-                logging.error(
-                    "Required nr of batteries (%d) or SmartShunts (%d) not found. Exiting...",
-                    settings.NR_OF_BATTERIES,
-                    NR_OF_SMARTSHUNTS,
-                )
-            else:
-                logging.info(self._batteries_dict)
-                logging.error("Required number of batteries not found. Exiting...")
-            tt.sleep(settings.TIME_BEFORE_RESTART)
-            sys.exit(1)
+            self._timeOld = tt.time()
+            # if current from BMS start the _update loop
+            GLib.timeout_add_seconds(settings.UPDATE_INTERVAL_DATA, self._update)
+
+        # stop calling this function
+        return False
 
     # #########################################################################
     # #########################################################################
@@ -804,7 +823,54 @@ class DbusAggBatService(object):
     # #################################################################################
     # #################################################################################
 
+    def _battery_services_changed(self) -> bool:
+        """
+        Report whether the set of battery services on the bus differs from the set
+        this aggregator is currently reading.
+
+        Only membership is checked, not the values. A service that is gone makes
+        every read return None, and a service that has come back has to pass the
+        product name and cell count checks in _find_batteries() before it may be
+        aggregated, so both cases are answered by rediscovery rather than here.
+
+        :return: True if a battery has left or joined the bus
+        """
+        known = self._dbusMon.dbusmon.servicesByName
+
+        for name, service in self._batteries_dict.items():
+            if service not in known:
+                logging.warning("Battery %s (%s) left the dbus. Rediscovering." % (name, service))
+                return True
+
+        aggregated = set(self._batteries_dict.values())
+        for service in list(known):
+            if service in aggregated or not service.startswith(settings.BATTERY_SERVICE_NAME):
+                continue
+            # excludes this aggregator itself, whose product name is AggregateBatteries
+            product_name = self._dbusMon.dbusmon.get_value(service, settings.BATTERY_PRODUCT_NAME_PATH)
+            if (product_name is not None) and (settings.BATTERY_PRODUCT_NAME in product_name):
+                logging.warning("Battery %s joined the dbus. Rediscovering." % service)
+                return True
+
+        return False
+
     def _update(self):
+
+        # A battery can leave the bus at any time (BMS protection trip, loose
+        # connector, driver restart) and come back later. Rediscover instead of
+        # reading from a service that is gone. This keeps the aggregator's own
+        # dbus service registered throughout, so DVCC holds the last limits and
+        # never loses its BMS - unlike exiting the process, which blocks charge
+        # and discharge until the restart has found every battery again.
+        if self._battery_services_changed():
+            self._searchTrials = 1
+            GLib.timeout_add_seconds(settings.UPDATE_INTERVAL_FIND_DEVICES, self._find_batteries)
+            # stop this loop, _find_batteries() starts it again when it is done
+            return False
+
+        # Everything below refers to the batteries actually being read, which is
+        # not necessarily NR_OF_BATTERIES: one of them may have dropped off.
+        batteryCount = len(self._batteries_dict)
 
         # DC
         Voltage = 0
@@ -1101,10 +1167,10 @@ class DbusAggBatService(object):
         # Process collected values (except of dictionaries) #
         #####################################################
 
-        # averaging
-        Voltage = Voltage / settings.NR_OF_BATTERIES
-        Temperature = Temperature / settings.NR_OF_BATTERIES
-        VoltagesSum = sum(VoltagesSum_dict.values()) / settings.NR_OF_BATTERIES
+        # averaging over the batteries actually read, not over the configured count
+        Voltage = Voltage / batteryCount
+        Temperature = Temperature / batteryCount
+        VoltagesSum = sum(VoltagesSum_dict.values()) / batteryCount
 
         # find max in alarms
         LowVoltage_alarm = self._fn._max(LowVoltage_alarm_list)
@@ -1134,8 +1200,8 @@ class DbusAggBatService(object):
                 MaxChargeCurrent = sum(MaxChargeCurrent_list)
                 MaxDischargeCurrent = sum(MaxDischargeCurrent_list)
             else:
-                MaxChargeCurrent = self._fn._min(MaxChargeCurrent_list) * settings.NR_OF_BATTERIES
-                MaxDischargeCurrent = self._fn._min(MaxDischargeCurrent_list) * settings.NR_OF_BATTERIES
+                MaxChargeCurrent = self._fn._min(MaxChargeCurrent_list) * batteryCount
+                MaxDischargeCurrent = self._fn._min(MaxDischargeCurrent_list) * batteryCount
 
         AllowToCharge = self._fn._min(AllowToCharge_list)
         AllowToDischarge = self._fn._min(AllowToDischarge_list)
@@ -1523,6 +1589,12 @@ class DbusAggBatService(object):
         if settings.LOG_PERIOD > 0 and int(tt.time()) - self._logLastPrintTimeStamp >= settings.LOG_PERIOD:
             self._logLastPrintTimeStamp = int(tt.time())
             logging.info(f"Repetitive logging (every {settings.LOG_PERIOD}s)")
+            if batteryCount != settings.NR_OF_BATTERIES:
+                logging.warning(
+                    "|- Aggregating %d of %d batteries. The missing ones are still on the busbar "
+                    "but not reported, so capacity and current limits are conservative."
+                    % (batteryCount, settings.NR_OF_BATTERIES)
+                )
             logging.info("|- CVL: %.1fV, CCL: %.0fA, DCL: %.0fA" % (MaxChargeVoltage, MaxChargeCurrent, MaxDischargeCurrent))
             logging.info("|- Bat. voltage: %.1fV, Bat. current: %.0fA, SoC: %.1f%%, Balancing state: %d" % (Voltage, Current, Soc, self._balancing))
             logging.info(
