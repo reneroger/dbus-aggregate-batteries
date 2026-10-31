@@ -9,15 +9,18 @@ class Functions:
     # Exception safe max and min (attention, not working with dictionaries)
     # another option: res = [i for i in test_list if i is not None]
 
+    # Skip None: a battery that does not publish a value (e.g. PACE
+    # /Alarms/CellImbalance) made max()/min() raise, so the aggregate became
+    # None instead of the worst real value and an alarm was never cleared.
     def _max(self, x):
         try:
-            return max(x)
+            return max(i for i in x if i is not None)
         except Exception:
             return None
 
     def _min(self, x):
         try:
-            return min(x)
+            return min(i for i in x if i is not None)
         except Exception:
             return None
 
